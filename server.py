@@ -29,7 +29,7 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 # JWT Configuration
-SECRET_KEY = "your-super-secret-key-that-should-be-changed-in-production-123456789"
+SECRET_KEY = "secret_key"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
