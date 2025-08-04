@@ -9,3 +9,4 @@ bcrypt
 qrcode[pil]
 pillow
 websockets
+PyJWT
