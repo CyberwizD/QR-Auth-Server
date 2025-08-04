@@ -6,6 +6,6 @@ python-multipart
 python-jose
 passlib
 bcrypt
-qrcode
+qrcode[pil]
 pillow
 websockets
