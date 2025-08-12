@@ -101,6 +101,9 @@ class UserResponse(BaseModel):
     class Config:
         from_attributes = True
 
+class UserUpdateResponse(BaseModel):
+    user: UserResponse
+
 class DeviceSessionResponse(BaseModel):
     id: int
     device_id: str
@@ -521,7 +524,7 @@ def revoke_device(
         db.rollback()
         raise HTTPException(status_code=500, detail="Error revoking device")
 
-@app.put("/user/profile", response_model=UserResponse)
+@app.put("/user/profile", response_model=UserUpdateResponse)
 def update_user_profile(
     user_data: UserUpdate,
     current_user: User = Depends(get_current_user),
