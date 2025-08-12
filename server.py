@@ -123,6 +123,10 @@ class QRSessionResponse(BaseModel):
 class QRScanRequest(BaseModel):
     session_id: str
 
+class UserUpdate(BaseModel):
+    username: Optional[str] = None
+    email: Optional[str] = None
+
 # FastAPI App
 app = FastAPI(title="QR Authentication API", version="1.0.0")
 
@@ -516,6 +520,39 @@ def revoke_device(
         logger.error(f"Error revoking device: {e}")
         db.rollback()
         raise HTTPException(status_code=500, detail="Error revoking device")
+
+@app.put("/user/profile", response_model=UserResponse)
+def update_user_profile(
+    user_data: UserUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    try:
+        if user_data.username:
+            # Check if username is already taken
+            existing_user = db.query(User).filter(User.username == user_data.username).first()
+            if existing_user and existing_user.id != current_user.id:
+                raise HTTPException(status_code=400, detail="Username already registered")
+            current_user.username = user_data.username
+
+        if user_data.email:
+            # Check if email is already taken
+            existing_user = db.query(User).filter(User.email == user_data.email).first()
+            if existing_user and existing_user.id != current_user.id:
+                raise HTTPException(status_code=400, detail="Email already registered")
+            current_user.email = user_data.email
+
+        db.commit()
+        db.refresh(current_user)
+        
+        logger.info(f"User profile updated for: {current_user.username}")
+        return { "user": current_user }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating user profile: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Internal server error during profile update")
 
 # Health check endpoint
 @app.get("/health")
