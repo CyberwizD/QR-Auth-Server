@@ -524,6 +524,11 @@ def revoke_device(
         db.rollback()
         raise HTTPException(status_code=500, detail="Error revoking device")
 
+class UserUpdateResponse(BaseModel):
+    user: UserResponse
+    access_token: str
+    token_type: str
+
 @app.put("/user/profile", response_model=UserUpdateResponse)
 def update_user_profile(
     user_data: UserUpdate,
@@ -548,8 +553,18 @@ def update_user_profile(
         db.commit()
         db.refresh(current_user)
         
+        # Generate a new token with the updated user info
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        new_access_token = create_access_token(
+            data={"sub": current_user.username}, expires_delta=access_token_expires
+        )
+        
         logger.info(f"User profile updated for: {current_user.username}")
-        return { "user": current_user }
+        return {
+            "user": current_user,
+            "access_token": new_access_token,
+            "token_type": "bearer"
+        }
     except HTTPException:
         raise
     except Exception as e:
