@@ -149,36 +149,32 @@ security = HTTPBearer()
 # WebSocket Connection Manager - FIXED VERSION
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: Dict[str, WebSocket] = {}
-    
-    async def connect(self, websocket: WebSocket, session_id: str):
-        await websocket.accept()
-        self.active_connections[session_id] = websocket
-        logger.info(f"🔌 WebSocket connected for session: {session_id}")
-    
-    def disconnect(self, session_id: str):
-        if session_id in self.active_connections:
-            del self.active_connections[session_id]
-            logger.info(f"🔌 WebSocket disconnected for session: {session_id}")
-    
-    async def send_personal_message(self, message: str, session_id: str):
-        if session_id in self.active_connections:
-            try:
-                websocket = self.active_connections[session_id]
-                logger.info(f"📨 Sending message to session {session_id}: {message}")
-                await websocket.send_text(message)
-                logger.info(f"✅ Message sent successfully to session: {session_id}")
-                return True
-            except Exception as e:
-                logger.error(f"❌ Error sending message to {session_id}: {e}")
-                self.disconnect(session_id)
-                return False
-        else:
-            logger.warning(f"⚠️ No active WebSocket connection for session: {session_id}")
-            return False
+        self.active_connections: Dict[int, List[WebSocket]] = {}
 
-    def is_connected(self, session_id: str) -> bool:
-        return session_id in self.active_connections
+    async def connect(self, websocket: WebSocket, user_id: int):
+        await websocket.accept()
+        if user_id not in self.active_connections:
+            self.active_connections[user_id] = []
+        self.active_connections[user_id].append(websocket)
+        logger.info(f"🔌 WebSocket connected for user: {user_id}")
+
+    def disconnect(self, websocket: WebSocket, user_id: int):
+        if user_id in self.active_connections:
+            self.active_connections[user_id].remove(websocket)
+            if not self.active_connections[user_id]:
+                del self.active_connections[user_id]
+        logger.info(f"🔌 WebSocket disconnected for user: {user_id}")
+
+    async def send_personal_message(self, message: str, websocket: WebSocket):
+        try:
+            await websocket.send_text(message)
+        except Exception as e:
+            logger.error(f"❌ Error sending message: {e}")
+
+    async def broadcast_to_user(self, message: str, user_id: int):
+        if user_id in self.active_connections:
+            for connection in self.active_connections[user_id]:
+                await self.send_personal_message(message, connection)
 
 manager = ConnectionManager()
 
@@ -261,26 +257,17 @@ def generate_qr_code(data: str) -> str:
         raise HTTPException(status_code=500, detail="Error generating QR code")
 
 # Background task for WebSocket notifications
-async def send_websocket_notification(session_id: str, message: dict):
-    """Send WebSocket notification in the background"""
+async def send_websocket_notification(user_id: int, message: dict):
+    """Send WebSocket notification to a user in the background"""
     try:
-        logger.info(f"📨 Preparing WebSocket notification for session: {session_id}")
+        logger.info(f"📨 Preparing WebSocket notification for user: {user_id}")
         logger.info(f"📨 Message: {message}")
         
-        # Check if WebSocket is connected
-        if not manager.is_connected(session_id):
-            logger.warning(f"⚠️ WebSocket not connected for session: {session_id}")
-            return False
-        
         message_json = json.dumps(message)
-        success = await manager.send_personal_message(message_json, session_id)
+        await manager.broadcast_to_user(message_json, user_id)
         
-        if success:
-            logger.info(f"✅ WebSocket notification sent successfully to session: {session_id}")
-        else:
-            logger.error(f"❌ Failed to send WebSocket notification to session: {session_id}")
-        
-        return success
+        logger.info(f"✅ WebSocket notification sent successfully to user: {user_id}")
+        return True
     except Exception as e:
         logger.error(f"❌ Error in WebSocket notification: {e}")
         return False
@@ -530,7 +517,7 @@ class UserUpdateResponse(BaseModel):
     token_type: str
 
 @app.put("/user/profile", response_model=UserUpdateResponse)
-def update_user_profile(
+async def update_user_profile(
     user_data: UserUpdate,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
@@ -559,6 +546,14 @@ def update_user_profile(
             data={"sub": current_user.username}, expires_delta=access_token_expires
         )
         
+        # Notify all active devices of the user about the profile update
+        message = {
+            "type": "profile_updated",
+            "user": UserResponse.from_orm(current_user).dict(),
+            "access_token": new_access_token
+        }
+        await send_websocket_notification(current_user.id, message)
+
         logger.info(f"User profile updated for: {current_user.username}")
         return {
             "user": current_user,
@@ -578,52 +573,27 @@ def health_check():
     return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
 
 # WebSocket Endpoint - IMPROVED VERSION
-@app.websocket("/ws/{session_id}")
-async def websocket_endpoint(websocket: WebSocket, session_id: str):
-    # Get database session
-    db = SessionLocal()
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket, token: str, db: Session = Depends(get_db)):
     try:
-        logger.info(f"🔌 WebSocket connection attempt for session: {session_id}")
-        
-        # Verify session exists
-        qr_session = db.query(QRSession).filter(QRSession.session_id == session_id).first()
-        if not qr_session:
-            logger.error(f"❌ WebSocket rejected - session not found: {session_id}")
+        username = verify_token(HTTPAuthorizationCredentials(scheme="Bearer", credentials=token))
+        user = db.query(User).filter(User.username == username).first()
+        if not user:
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
+
+        await manager.connect(websocket, user.id)
         
-        logger.info(f"✅ QR session found, accepting WebSocket connection: {session_id}")
-        await manager.connect(websocket, session_id)
-        
-        # Send initial connection confirmation
-        await websocket.send_text(json.dumps({
-            "type": "connected",
-            "session_id": session_id,
-            "message": "WebSocket connected successfully"
-        }))
-        
-        while True:
-            # Keep connection alive and listen for messages
-            try:
+        try:
+            while True:
                 data = await websocket.receive_text()
-                logger.info(f"📨 WebSocket received: {data}")
-                
-                # Echo back for keep-alive (but don't log it)
-                if not data.startswith("ping"):
-                    await websocket.send_text(f"Echo: {data}")
-                    
-            except WebSocketDisconnect:
-                logger.info(f"🔌 WebSocket disconnected normally: {session_id}")
-                break
-            except Exception as e:
-                logger.error(f"❌ WebSocket error: {e}")
-                break
+                logger.info(f"📨 WebSocket received from user {user.id}: {data}")
+                # Echo back for keep-alive
+                await websocket.send_text(f"Echo: {data}")
+        except WebSocketDisconnect:
+            manager.disconnect(websocket, user.id)
     except Exception as e:
         logger.error(f"❌ WebSocket endpoint error: {e}")
-    finally:
-        manager.disconnect(session_id)
-        db.close()
-        logger.info(f"🔌 WebSocket cleanup completed for session: {session_id}")
 
 @app.get("/")
 def root():
@@ -645,5 +615,5 @@ def root():
 
 if __name__ == "__main__":
     import uvicorn
-    logger.info("🚀 Starting QR Authentication API server...")
+    logger.info("� Starting QR Authentication API server...")
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
