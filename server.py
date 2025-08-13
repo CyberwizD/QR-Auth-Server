@@ -281,17 +281,48 @@ def generate_qr_code(data: str) -> str:
     return base64.b64encode(buffer.getvalue()).decode()
 
 # --- API Endpoints ---
+@app.get("/")
+def root():
+    return {"message": "QR Authentication API is running", "version": "1.2.0"}
+
 @app.post("/qr/generate", response_model=QRSessionResponse)
-def generate_qr_session(qr_data: QRSessionCreate, db: Session = Depends(get_db)):
-    session_id = str(uuid.uuid4())
-    expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
-    qr_session = QRSession(session_id=session_id, expires_at=expires_at, device_info=qr_data.device_info)
-    db.add(qr_session)
-    db.commit()
-    qr_data_dict = {"session_id": session_id, "expires_at": expires_at.isoformat()}
-    qr_code_data = generate_qr_code(json.dumps(qr_data_dict))
-    logger.info(f"QR session generated: {session_id}")
-    return QRSessionResponse(session_id=session_id, qr_code_data=qr_code_data, expires_at=expires_at)
+def generate_qr_session(qr_data: Optional[QRSessionCreate] = None, db: Session = Depends(get_db)):
+    """Generate a new QR session for device authentication"""
+    try:
+        session_id = str(uuid.uuid4())
+        expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+        
+        # Handle optional QRSessionCreate data
+        device_info = None
+        if qr_data and qr_data.device_info:
+            device_info = qr_data.device_info
+        
+        qr_session = QRSession(
+            session_id=session_id, 
+            expires_at=expires_at, 
+            device_info=device_info
+        )
+        
+        db.add(qr_session)
+        db.commit()
+        
+        # Create QR code data
+        qr_data_dict = {
+            "session_id": session_id, 
+            "expires_at": expires_at.isoformat()
+        }
+        qr_code_data = generate_qr_code(json.dumps(qr_data_dict))
+        
+        logger.info(f"QR session generated: {session_id}")
+        
+        return QRSessionResponse(
+            session_id=session_id, 
+            qr_code_data=qr_code_data, 
+            expires_at=expires_at
+        )
+    except Exception as e:
+        logger.error(f"Error generating QR session: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate QR session: {str(e)}")
 
 @app.post("/auth/register", response_model=UserResponse)
 def register_user(user_data: UserCreate, db: Session = Depends(get_db)):
@@ -399,83 +430,167 @@ async def update_user_profile(user_data: UserUpdate, current_user: User = Depend
 
 # --- WebSocket Endpoints ---
 @app.websocket("/ws/login/{session_id}")
-async def websocket_login_endpoint(websocket: WebSocket, session_id: str, db: Session = Depends(get_db)):
-    qr_session = db.query(QRSession).filter(QRSession.session_id == session_id).first()
-    if not qr_session or qr_session.is_used or datetime.now(timezone.utc) > qr_session.expires_at:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        return
-    
-    await manager.connect_login(websocket, session_id)
+async def websocket_login_endpoint(websocket: WebSocket, session_id: str):
+    """WebSocket endpoint for QR login sessions"""
     try:
-        while True:
-            # Send periodic ping to keep connection alive
-            try:
-                await websocket.send_text(json.dumps({"type": "ping", "timestamp": datetime.now(timezone.utc).isoformat()}))
-                await asyncio.sleep(30)  # Ping every 30 seconds
-            except Exception as e:
-                logger.error(f"Error sending ping: {e}")
-                break
-    except WebSocketDisconnect:
-        manager.disconnect_login(session_id)
+        # Get database session
+        db = SessionLocal()
+        try:
+            qr_session = db.query(QRSession).filter(QRSession.session_id == session_id).first()
+            
+            # Validate QR session exists and is not expired
+            if not qr_session:
+                logger.error(f"QR session not found: {session_id}")
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Session not found")
+                return
+                
+            if qr_session.is_used:
+                logger.error(f"QR session already used: {session_id}")
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Session already used")
+                return
+                
+            # Compare timezone-aware datetimes
+            current_time = datetime.now(timezone.utc)
+            if qr_session.expires_at.tzinfo is None:
+                # If expires_at is naive, make it UTC
+                expires_at_utc = qr_session.expires_at.replace(tzinfo=timezone.utc)
+            else:
+                expires_at_utc = qr_session.expires_at
+                
+            if current_time > expires_at_utc:
+                logger.error(f"QR session expired: {session_id}")
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Session expired")
+                return
+                
+        finally:
+            db.close()
+        
+        # Connect to manager
+        await manager.connect_login(websocket, session_id)
+        
+        try:
+            while True:
+                # Send periodic ping to keep connection alive
+                try:
+                    ping_message = json.dumps({
+                        "type": "ping", 
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "session_id": session_id
+                    })
+                    await websocket.send_text(ping_message)
+                    await asyncio.sleep(30)  # Ping every 30 seconds
+                except Exception as e:
+                    logger.error(f"Error sending ping to {session_id}: {e}")
+                    break
+        except WebSocketDisconnect:
+            logger.info(f"WebSocket disconnected for session: {session_id}")
+        except Exception as e:
+            logger.error(f"WebSocket error for session {session_id}: {e}")
+        finally:
+            manager.disconnect_login(session_id)
+            
+    except Exception as e:
+        logger.error(f"Critical error in WebSocket login endpoint: {e}")
+        try:
+            await websocket.close(code=status.WS_1011_INTERNAL_ERROR, reason="Internal server error")
+        except:
+            pass
 
 @app.websocket("/ws/listen")
-async def websocket_listen_endpoint(websocket: WebSocket, token: str = Query(...), db: Session = Depends(get_db)):
+async def websocket_listen_endpoint(websocket: WebSocket, token: str = Query(...)):
+    """WebSocket endpoint for authenticated user connections"""
     try:
-        user = get_current_user_from_token(token, db)
-        if not user:
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-            return
-    except:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        return
+        # Validate token and get user
+        db = SessionLocal()
+        try:
+            user = get_current_user_from_token(token, db)
+            if not user:
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid token")
+                return
+        finally:
+            db.close()
 
-    await manager.connect_user(websocket, user.id)
-    try:
-        while True:
-            # Send periodic ping to keep connection alive
-            try:
-                await websocket.send_text(json.dumps({"type": "ping", "timestamp": datetime.now(timezone.utc).isoformat()}))
-                await asyncio.sleep(30)  # Ping every 30 seconds
-            except Exception as e:
-                logger.error(f"Error sending ping: {e}")
-                break
-    except WebSocketDisconnect:
-        manager.disconnect_user(websocket, user.id)
+        await manager.connect_user(websocket, user.id)
+        
+        try:
+            while True:
+                # Send periodic ping to keep connection alive
+                try:
+                    ping_message = json.dumps({
+                        "type": "ping", 
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "user_id": user.id
+                    })
+                    await websocket.send_text(ping_message)
+                    await asyncio.sleep(30)  # Ping every 30 seconds
+                except Exception as e:
+                    logger.error(f"Error sending ping to user {user.id}: {e}")
+                    break
+        except WebSocketDisconnect:
+            logger.info(f"User WebSocket disconnected: {user.id}")
+        finally:
+            manager.disconnect_user(websocket, user.id)
+            
+    except Exception as e:
+        logger.error(f"Critical error in WebSocket listen endpoint: {e}")
+        try:
+            await websocket.close(code=status.WS_1011_INTERNAL_ERROR, reason="Internal server error")
+        except:
+            pass
 
-# NEW: General WebSocket endpoint for backward compatibility
+# General WebSocket endpoint for backward compatibility
 @app.websocket("/ws")
-async def websocket_general_endpoint(websocket: WebSocket, token: str = Query(...), db: Session = Depends(get_db)):
+async def websocket_general_endpoint(websocket: WebSocket, token: str = Query(...)):
+    """General WebSocket endpoint for backward compatibility"""
     try:
-        user = get_current_user_from_token(token, db)
-        if not user:
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-            return
-    except:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-        return
+        # Validate token and get user
+        db = SessionLocal()
+        try:
+            user = get_current_user_from_token(token, db)
+            if not user:
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid token")
+                return
+        finally:
+            db.close()
 
-    connection_id = str(uuid.uuid4())
-    await manager.connect_general(websocket, connection_id, user.id)
-    
-    try:
-        while True:
-            # Keep connection alive and handle any incoming messages
-            try:
-                # Wait for messages or send periodic pings
-                message = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
-                # Echo back for debugging
-                await websocket.send_text(f"Echo: {message}")
-            except asyncio.TimeoutError:
-                # Send ping if no message received in 30 seconds
-                await websocket.send_text(json.dumps({
-                    "type": "ping", 
-                    "timestamp": datetime.now(timezone.utc).isoformat()
-                }))
-            except Exception as e:
-                logger.error(f"Error in WebSocket communication: {e}")
-                break
-    except WebSocketDisconnect:
-        manager.disconnect_general(connection_id)
+        connection_id = str(uuid.uuid4())
+        await manager.connect_general(websocket, connection_id, user.id)
+        
+        try:
+            while True:
+                # Keep connection alive and handle any incoming messages
+                try:
+                    # Wait for messages or send periodic pings
+                    message = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+                    # Echo back for debugging
+                    echo_response = json.dumps({
+                        "type": "echo",
+                        "original_message": message,
+                        "timestamp": datetime.now(timezone.utc).isoformat()
+                    })
+                    await websocket.send_text(echo_response)
+                except asyncio.TimeoutError:
+                    # Send ping if no message received in 30 seconds
+                    ping_message = json.dumps({
+                        "type": "ping", 
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "connection_id": connection_id
+                    })
+                    await websocket.send_text(ping_message)
+                except Exception as e:
+                    logger.error(f"Error in WebSocket communication: {e}")
+                    break
+        except WebSocketDisconnect:
+            logger.info(f"General WebSocket disconnected: {connection_id}")
+        finally:
+            manager.disconnect_general(connection_id)
+            
+    except Exception as e:
+        logger.error(f"Critical error in general WebSocket endpoint: {e}")
+        try:
+            await websocket.close(code=status.WS_1011_INTERNAL_ERROR, reason="Internal server error")
+        except:
+            pass
 
 if __name__ == "__main__":
     import uvicorn
