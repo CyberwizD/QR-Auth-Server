@@ -1,10 +1,11 @@
+# Add these imports at the top
 from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect, status, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, ForeignKey
 from sqlalchemy.orm import declarative_base, sessionmaker, Session, relationship
 from pydantic import BaseModel
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List
 import jwt
 import bcrypt
@@ -27,7 +28,7 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 # --- JWT Configuration ---
-SECRET_KEY = "your_very_secret_key"  # IMPORTANT: Use a strong, secret key in production
+SECRET_KEY = "your_very_secret_key"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 days
 
@@ -38,7 +39,7 @@ class User(Base):
     username = Column(String, unique=True, index=True, nullable=False)
     email = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     is_active = Column(Boolean, default=True)
     devices = relationship("DeviceSession", back_populates="user")
     qr_sessions = relationship("QRSession", back_populates="user")
@@ -50,8 +51,8 @@ class DeviceSession(Base):
     device_id = Column(String, unique=True, index=True)
     device_name = Column(String)
     session_token = Column(String, unique=True, index=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    last_active = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    last_active = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     is_active = Column(Boolean, default=True)
     user = relationship("User", back_populates="devices")
 
@@ -60,7 +61,7 @@ class QRSession(Base):
     id = Column(Integer, primary_key=True, index=True)
     session_id = Column(String, unique=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
     expires_at = Column(DateTime)
     is_used = Column(Boolean, default=False)
     is_expired = Column(Boolean, default=False)
@@ -85,7 +86,8 @@ class UserResponse(BaseModel):
     email: str
     created_at: datetime
     is_active: bool
-    class Config: from_attributes = True
+    class Config: 
+        from_attributes = True
 
 class UserUpdate(BaseModel):
     username: Optional[str] = None
@@ -103,7 +105,8 @@ class DeviceSessionResponse(BaseModel):
     created_at: datetime
     last_active: datetime
     is_active: bool
-    class Config: from_attributes = True
+    class Config: 
+        from_attributes = True
 
 class QRSessionCreate(BaseModel):
     device_info: Optional[str] = None
@@ -117,7 +120,7 @@ class QRScanRequest(BaseModel):
     session_id: str
 
 # --- FastAPI App ---
-app = FastAPI(title="QR Authentication API", version="1.1.0")
+app = FastAPI(title="QR Authentication API", version="1.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -127,11 +130,12 @@ app.add_middleware(
 )
 security = HTTPBearer()
 
-# --- WebSocket Connection Manager (REFACTORED) ---
+# --- WebSocket Connection Manager ---
 class ConnectionManager:
     def __init__(self):
         self.login_connections: Dict[str, WebSocket] = {}
         self.user_connections: Dict[int, List[WebSocket]] = {}
+        self.general_connections: Dict[str, WebSocket] = {}  # For general user connections
 
     async def connect_login(self, websocket: WebSocket, session_id: str):
         await websocket.accept()
@@ -149,13 +153,36 @@ class ConnectionManager:
             self.user_connections[user_id] = []
         self.user_connections[user_id].append(websocket)
         logger.info(f"🔌 User WebSocket connected for user_id: {user_id}")
+        
+        # Send connection confirmation
+        await websocket.send_text(json.dumps({
+            "type": "connected",
+            "message": "WebSocket connection established"
+        }))
 
     def disconnect_user(self, websocket: WebSocket, user_id: int):
-        if user_id in self.user_connections:
+        if user_id in self.user_connections and websocket in self.user_connections[user_id]:
             self.user_connections[user_id].remove(websocket)
             if not self.user_connections[user_id]:
                 del self.user_connections[user_id]
         logger.info(f"🔌 User WebSocket disconnected for user_id: {user_id}")
+
+    async def connect_general(self, websocket: WebSocket, connection_id: str, user_id: int):
+        await websocket.accept()
+        self.general_connections[connection_id] = websocket
+        logger.info(f"🔌 General WebSocket connected: {connection_id} for user: {user_id}")
+        
+        # Send connection confirmation
+        await websocket.send_text(json.dumps({
+            "type": "connected",
+            "message": "WebSocket connection established",
+            "user_id": user_id
+        }))
+
+    def disconnect_general(self, connection_id: str):
+        if connection_id in self.general_connections:
+            del self.general_connections[connection_id]
+            logger.info(f"🔌 General WebSocket disconnected: {connection_id}")
 
     async def send_to_login_session(self, message: str, session_id: str):
         if session_id in self.login_connections:
@@ -170,6 +197,7 @@ class ConnectionManager:
         return False
 
     async def broadcast_to_user(self, message: str, user_id: int):
+        # Send to user-specific connections
         if user_id in self.user_connections:
             disconnected_sockets = []
             for websocket in self.user_connections[user_id]:
@@ -177,9 +205,22 @@ class ConnectionManager:
                     await websocket.send_text(message)
                 except Exception:
                     disconnected_sockets.append(websocket)
-            for websocket in disconnected_sockets:
-                self.disconnect_user(websocket, user_id)
-            logger.info(f"✅ Broadcasted message to user: {user_id}")
+            
+            for ws in disconnected_sockets:
+                self.disconnect_user(ws, user_id)
+        
+        # Also send to general connections (for backward compatibility)
+        disconnected_connections = []
+        for conn_id, websocket in self.general_connections.items():
+            try:
+                await websocket.send_text(message)
+            except Exception:
+                disconnected_connections.append(conn_id)
+        
+        for conn_id in disconnected_connections:
+            self.disconnect_general(conn_id)
+            
+        logger.info(f"✅ Broadcasted message to user: {user_id}")
 
 manager = ConnectionManager()
 
@@ -199,7 +240,7 @@ def verify_password(password: str, hashed_password: str) -> bool:
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
+    expire = datetime.now(timezone.utc) + (expires_delta or timedelta(minutes=15))
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
@@ -208,18 +249,50 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
         token = credentials.credentials
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username: str = payload.get("sub")
-        if username is None:
-            raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+        if not username:
+            raise HTTPException(status_code=401, detail="Invalid token: no subject")
         user = db.query(User).filter(User.username == username).first()
-        if user is None:
+        if not user:
             raise HTTPException(status_code=404, detail="User not found")
         return user
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token has expired")
     except jwt.PyJWTError:
-        raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+def get_current_user_from_token(token: str, db: Session):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if not username:
+            return None
+        user = db.query(User).filter(User.username == username).first()
+        return user
+    except:
+        return None
+
+def generate_qr_code(data: str) -> str:
+    qr = qrcode.QRCode(version=1, box_size=10, border=5)
+    qr.add_data(data)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    buffer = io.BytesIO()
+    img.save(buffer, format='PNG')
+    return base64.b64encode(buffer.getvalue()).decode()
 
 # --- API Endpoints ---
+@app.post("/qr/generate", response_model=QRSessionResponse)
+def generate_qr_session(qr_data: QRSessionCreate, db: Session = Depends(get_db)):
+    session_id = str(uuid.uuid4())
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+    qr_session = QRSession(session_id=session_id, expires_at=expires_at, device_info=qr_data.device_info)
+    db.add(qr_session)
+    db.commit()
+    qr_data_dict = {"session_id": session_id, "expires_at": expires_at.isoformat()}
+    qr_code_data = generate_qr_code(json.dumps(qr_data_dict))
+    logger.info(f"QR session generated: {session_id}")
+    return QRSessionResponse(session_id=session_id, qr_code_data=qr_code_data, expires_at=expires_at)
+
 @app.post("/auth/register", response_model=UserResponse)
 def register_user(user_data: UserCreate, db: Session = Depends(get_db)):
     if db.query(User).filter((User.username == user_data.username) | (User.email == user_data.email)).first():
@@ -239,42 +312,56 @@ def login_user(user_data: UserLogin, db: Session = Depends(get_db)):
     if not user.is_active:
         raise HTTPException(status_code=401, detail="User account is disabled")
     access_token = create_access_token(data={"sub": user.username}, expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
-    return {"access_token": access_token, "token_type": "bearer", "user": UserResponse.from_orm(user)}
+    return {"access_token": access_token, "token_type": "bearer", "user": UserResponse.model_validate(user)}
 
 @app.get("/auth/me", response_model=UserResponse)
 def get_current_user_info(current_user: User = Depends(get_current_user)):
     return current_user
 
-@app.post("/qr/generate", response_model=QRSessionResponse)
-def generate_qr_session(db: Session = Depends(get_db)):
-    session_id = str(uuid.uuid4())
-    expires_at = datetime.utcnow() + timedelta(minutes=5)
-    qr_session = QRSession(session_id=session_id, expires_at=expires_at)
-    db.add(qr_session)
+@app.get("/devices", response_model=List[DeviceSessionResponse])
+def get_user_devices(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    devices = db.query(DeviceSession).filter(DeviceSession.user_id == current_user.id).all()
+    return devices
+
+@app.delete("/devices/{device_id}")
+def revoke_device(device_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    device = db.query(DeviceSession).filter(
+        DeviceSession.device_id == device_id,
+        DeviceSession.user_id == current_user.id
+    ).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    device.is_active = False
     db.commit()
-    qr_data_dict = {"session_id": session_id, "expires_at": expires_at.isoformat()}
-    qr_code_data = generate_qr_code(json.dumps(qr_data_dict))
-    return QRSessionResponse(session_id=session_id, qr_code_data=qr_code_data, expires_at=expires_at)
+    return {"message": "Device revoked successfully"}
 
 @app.post("/qr/scan")
 async def scan_qr_code(scan_data: QRScanRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     qr_session = db.query(QRSession).filter(QRSession.session_id == scan_data.session_id).first()
-    if not qr_session or qr_session.is_used or datetime.utcnow() > qr_session.expires_at:
+    if not qr_session or qr_session.is_used or datetime.now(timezone.utc) > qr_session.expires_at:
         raise HTTPException(status_code=404, detail="QR session is invalid or has expired")
     
     qr_session.is_used = True
     qr_session.user_id = current_user.id
     
     device_id = str(uuid.uuid4())
-    session_token = create_access_token(data={"sub": current_user.username, "device_id": device_id}, expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    session_token = create_access_token(
+        data={"sub": current_user.username, "device_id": device_id}, 
+        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
     
-    device_session = DeviceSession(user_id=current_user.id, device_id=device_id, device_name=qr_session.device_info or "Desktop/Web Client", session_token=session_token)
+    device_session = DeviceSession(
+        user_id=current_user.id, 
+        device_id=device_id, 
+        device_name=qr_session.device_info or "Desktop/Web Client", 
+        session_token=session_token
+    )
     db.add(device_session)
     db.commit()
     
     message = {
         "type": "login_success",
-        "user": json.loads(UserResponse.from_orm(current_user).json()),
+        "user": json.loads(UserResponse.model_validate(current_user).model_dump_json()),
         "session_token": session_token,
         "device_id": device_id
     }
@@ -296,50 +383,99 @@ async def update_user_profile(user_data: UserUpdate, current_user: User = Depend
     db.commit()
     db.refresh(current_user)
     
-    new_access_token = create_access_token(data={"sub": current_user.username}, expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    new_access_token = create_access_token(
+        data={"sub": current_user.username}, 
+        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
     
     message = {
         "type": "profile_updated",
-        "user": json.loads(UserResponse.from_orm(current_user).json()),
+        "user": json.loads(UserResponse.model_validate(current_user).model_dump_json()),
         "access_token": new_access_token
     }
     await manager.broadcast_to_user(json.dumps(message), current_user.id)
     
     return UserUpdateResponse(user=current_user, access_token=new_access_token)
 
-# --- WebSocket Endpoints (REFACTORED) ---
+# --- WebSocket Endpoints ---
 @app.websocket("/ws/login/{session_id}")
 async def websocket_login_endpoint(websocket: WebSocket, session_id: str, db: Session = Depends(get_db)):
     qr_session = db.query(QRSession).filter(QRSession.session_id == session_id).first()
-    if not qr_session or qr_session.is_used or datetime.utcnow() > qr_session.expires_at:
+    if not qr_session or qr_session.is_used or datetime.now(timezone.utc) > qr_session.expires_at:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
     
     await manager.connect_login(websocket, session_id)
     try:
         while True:
-            await websocket.receive_text()  # Keep connection alive
+            # Send periodic ping to keep connection alive
+            try:
+                await websocket.send_text(json.dumps({"type": "ping", "timestamp": datetime.now(timezone.utc).isoformat()}))
+                await asyncio.sleep(30)  # Ping every 30 seconds
+            except Exception as e:
+                logger.error(f"Error sending ping: {e}")
+                break
     except WebSocketDisconnect:
         manager.disconnect_login(session_id)
 
 @app.websocket("/ws/listen")
 async def websocket_listen_endpoint(websocket: WebSocket, token: str = Query(...), db: Session = Depends(get_db)):
     try:
-        credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials=token)
-        user = get_current_user(credentials, db)
+        user = get_current_user_from_token(token, db)
         if not user:
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
-    except HTTPException:
+    except:
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
     await manager.connect_user(websocket, user.id)
     try:
         while True:
-            await websocket.receive_text() # Keep connection alive
+            # Send periodic ping to keep connection alive
+            try:
+                await websocket.send_text(json.dumps({"type": "ping", "timestamp": datetime.now(timezone.utc).isoformat()}))
+                await asyncio.sleep(30)  # Ping every 30 seconds
+            except Exception as e:
+                logger.error(f"Error sending ping: {e}")
+                break
     except WebSocketDisconnect:
         manager.disconnect_user(websocket, user.id)
+
+# NEW: General WebSocket endpoint for backward compatibility
+@app.websocket("/ws")
+async def websocket_general_endpoint(websocket: WebSocket, token: str = Query(...), db: Session = Depends(get_db)):
+    try:
+        user = get_current_user_from_token(token, db)
+        if not user:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+    except:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    connection_id = str(uuid.uuid4())
+    await manager.connect_general(websocket, connection_id, user.id)
+    
+    try:
+        while True:
+            # Keep connection alive and handle any incoming messages
+            try:
+                # Wait for messages or send periodic pings
+                message = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+                # Echo back for debugging
+                await websocket.send_text(f"Echo: {message}")
+            except asyncio.TimeoutError:
+                # Send ping if no message received in 30 seconds
+                await websocket.send_text(json.dumps({
+                    "type": "ping", 
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                }))
+            except Exception as e:
+                logger.error(f"Error in WebSocket communication: {e}")
+                break
+    except WebSocketDisconnect:
+        manager.disconnect_general(connection_id)
 
 if __name__ == "__main__":
     import uvicorn
