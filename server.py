@@ -369,8 +369,19 @@ def revoke_device(device_id: str, current_user: User = Depends(get_current_user)
 @app.post("/qr/scan")
 async def scan_qr_code(scan_data: QRScanRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     qr_session = db.query(QRSession).filter(QRSession.session_id == scan_data.session_id).first()
-    if not qr_session or qr_session.is_used or datetime.now(timezone.utc) > qr_session.expires_at:
-        raise HTTPException(status_code=404, detail="QR session is invalid or has expired")
+
+    # Validate the QR session
+    if not qr_session or qr_session.is_used:
+        raise HTTPException(status_code=404, detail="QR session is invalid or already used")
+
+    # Ensure expires_at is timezone-aware (UTC)
+    expires_at_utc = qr_session.expires_at
+    if expires_at_utc.tzinfo is None:
+        expires_at_utc = expires_at_utc.replace(tzinfo=timezone.utc)
+
+    # Check if the session has expired
+    if datetime.now(timezone.utc) > expires_at_utc:
+        raise HTTPException(status_code=404, detail="QR session has expired")
     
     qr_session.is_used = True
     qr_session.user_id = current_user.id
