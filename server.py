@@ -351,7 +351,10 @@ def get_current_user_info(current_user: User = Depends(get_current_user)):
 
 @app.get("/devices", response_model=List[DeviceSessionResponse])
 def get_user_devices(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    devices = db.query(DeviceSession).filter(DeviceSession.user_id == current_user.id).all()
+    devices = db.query(DeviceSession).filter(
+        DeviceSession.user_id == current_user.id,
+        DeviceSession.is_active == True
+    ).all()
     return devices
 
 @app.delete("/devices/{device_id}")
@@ -362,7 +365,8 @@ def revoke_device(device_id: str, current_user: User = Depends(get_current_user)
     ).first()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
-    device.is_active = False
+    
+    db.delete(device)
     db.commit()
     return {"message": "Device revoked successfully"}
 
