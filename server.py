@@ -283,7 +283,22 @@ def generate_qr_code(data: str) -> str:
 # --- API Endpoints ---
 @app.get("/")
 def root():
-    return {"message": "QR Authentication API is running", "version": "1.2.0"}
+    return {
+        "message": "QR Authentication API",
+        "version": "1.2.0",
+        "status": "running",
+        "endpoints": {
+            "register": "/auth/register",
+            "login": "/auth/login",
+            "me": "/auth/me",
+            "profile": "/user/profile",
+            "generate_qr": "/qr/generate",
+            "scan_qr": "/qr/scan",
+            "devices": "/devices",
+            "websocket": "/ws/{session_id}",
+            "health": "/health"
+        }
+    }
 
 @app.post("/qr/generate", response_model=QRSessionResponse)
 def generate_qr_session(qr_data: Optional[QRSessionCreate] = None, db: Session = Depends(get_db)):
